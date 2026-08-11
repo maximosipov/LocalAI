@@ -364,6 +364,15 @@ func GetGPUMemoryUsage() []GPUMemoryInfo {
 		gpus = append(gpus, appleGPUs...)
 	}
 
+	// Try non-Apple GPUs on macOS: a discrete AMD/NVIDIA card or an Intel iGPU
+	// on an Intel Mac is invisible to every path above (no nvidia-smi, no
+	// rocm-smi, no clinfo, and getAppleGPUMemory filters by vendor), which left
+	// LocalAI reporting no GPU and 0 VRAM on hardware that has both.
+	if len(gpus) == 0 {
+		macGPUs := getMacDiscreteGPUMemory()
+		gpus = append(gpus, macGPUs...)
+	}
+
 	return gpus
 }
 
