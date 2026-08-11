@@ -10,6 +10,10 @@ Target: **MacBook Pro 16" 2019 · AMD Radeon Pro 5500M (4 GB, RDNA1) · Intel UH
 
 ggml's Metal backend re-reads model weights over PCIe on every token when the GPU is discrete rather than unified-memory — roughly 0.8 tok/s. Vulkan/MoltenVK keeps the weights resident. Every build step below disables Metal explicitly.
 
+## Requires MoltenVK >= 1.4.2
+
+Up to 1.4.1, MoltenVK reported `subgroupSize 64` on AMD Macs while Metal runs 32-wide SIMD groups, so every subgroup reduction in every shader spanned the wrong lane count — the root cause behind the matmul corruption and the NaN in the hybrid-model shaders. `brew list --versions molten-vk` must report >= 1.4.2. The llama.cpp fixes gate their workarounds on `driverVersion`, so older drivers still produce correct output, but the flash-attention and quantized-KV behaviour documented below assumes 1.4.2.
+
 ## Dependencies (Homebrew)
 
 ```sh
@@ -32,27 +36,43 @@ make build          # protogen + React UI + go build -> ./local-ai
 
 LocalAI's llama backend is a **separate gRPC server process** built from a llama.cpp checkout, with LocalAI's `grpc-server.cpp` grafted into `llama.cpp/tools/`. Two things have to be true of that checkout at once:
 
-1. it must carry the **Vulkan correctness fixes** for this GPU (subgroup matmul, and the NaN-producing `SSM_SCAN`/`GATED_DELTA_NET` shaders), and
+1. it must carry the **Vulkan fixes** for this GPU — subgroup matmul, the NaN-producing `SSM_SCAN`/`GATED_DELTA_NET` shaders, the q8_1 activation quantizer, the q8_0 vector-matmul guard, plus the two performance changes (emulated integer dot, and flash attention actually running on the GPU) — and
 2. it must be the **commit LocalAI pins** — `grpc-server.cpp` tracks llama.cpp's internal server API, which moves within days.
 
-So don't build from the llama.cpp fork's branch tip. Check out the pinned commit and cherry-pick the three fix commits onto it:
+So don't build from the llama.cpp fork's branch tip. Check out the pinned commit and cherry-pick the fix commits onto it:
 
 ```sh
 PIN="$(sed -n 's/^LLAMA_VERSION?=//p' backend/cpp/llama-cpp/Makefile)"
 
 git clone https://github.com/maximosipov/llama.cpp.git backend/cpp/llama-cpp/llama.cpp
 cd backend/cpp/llama-cpp/llama.cpp
-git fetch https://github.com/ggml-org/llama.cpp.git master --tags
+# Fetch the pinned commit explicitly by SHA. It is a plain master commit, not a tag,
+# and it is not necessarily an ancestor of the fork's branch, so a fork-only clone
+# will not have it.
+git fetch https://github.com/ggml-org/llama.cpp.git "$PIN"
 git checkout -b build "$PIN"
-# The 3 fix commits from the fork's macbook-pro-2019-radeon-5500m-4gb branch, oldest
+# The fix commits from the fork's macbook-pro-2019-radeon-5500m-4gb branch, oldest
 # first. Explicit SHAs: upstream llama.cpp history has its own unrelated "vulkan: fix ..."
 # commits, so a message grep is not safe here.
-git cherry-pick 7847fca13 595936bcd a91f29c5f
+git cherry-pick 7847fca13 595936bcd a91f29c5f \
+                acb45b872 8cbd19056 8e8d7fb26 16ea5d8e7 e629266a1 2707498b9
 git submodule update --init --recursive --depth 1
 cd ../../../..
 ```
 
-If a future `LLAMA_VERSION` bump makes those stop applying, the fixes are narrow (`ggml-vulkan.cpp` plus two `.comp` shaders) — diff them off the branch and re-apply.
+| Commit | What it does |
+|---|---|
+| `7847fca13` | matmul subgroup correctness on MoltenVK (RDNA1 + older Intel iGPUs) |
+| `595936bcd` | NaN `SSM_SCAN` / `GATED_DELTA_NET` — hybrid/state-space models (Granite-4.0-H, Qwen3.5) |
+| `a91f29c5f` | diagnostic env knobs (opt-in, no default change) |
+| `acb45b872` | disable subgroup clustered ops — fixes the q8_1 activation quantizer |
+| `8cbd19056` | enable emulated integer dot for matmul: **+68% prefill** |
+| `8e8d7fb26` | flash-attention subgroup diagnostic knob (superseded by the next one) |
+| `16ea5d8e7` | **run flash attention on the GPU** — it was silently falling back to CPU |
+| `e629266a1` | guard the broken q8_0 `mul_mat_vecq` path |
+| `2707498b9` | trust MoltenVK subgroups from 1.4.2 onwards |
+
+Verified: all nine cherry-pick cleanly onto `1cbfd1988`, and `prepare.sh` still grafts on top. If a future `LLAMA_VERSION` bump makes them stop applying, the changes are narrow (`ggml-vulkan.cpp` plus three `.comp` shaders) — diff them off the branch and re-apply.
 
 Then graft in LocalAI's gRPC server. **Run this once**: `prepare.sh` applies LocalAI's own patches to the llama.cpp tree and is not idempotent.
 
@@ -126,9 +146,11 @@ parameters:
 context_size: 4096
 f16: true
 gpu_layers: 99
-# Flash attention measures ~2.3x SLOWER on MoltenVK/RDNA1 in a counterbalanced A/B (no
-# cooperative-matrix kernels, so it takes a fallback path). Leave it off.
-flash_attention: "false"
+# Flash attention runs on the GPU with commit 16ea5d8e7 and is the faster option for
+# decode (~+5%). Earlier revisions of this file said "false, ~2.3x slower" -- that
+# measurement was real but the cause was not a slow kernel: FLASH_ATTN_EXT was
+# unsupported on Vulkan for AMD Macs, so every attention op ran on the CPU.
+flash_attention: "true"
 EOF
 
 ./local-ai run --address 127.0.0.1:8080 --models-path ./models \
@@ -152,7 +174,9 @@ LocalAI's own hardware probe reports `GPU vendor=""` and `Total available VRAM 0
 ioreg -r -d 1 -w 0 -c IOAccelerator | grep -o '"inUseVidMemoryBytes"=[0-9]*'
 ```
 
-A 4B Q4_K_M model resident on the GPU shows ~3.4 GiB in use on the AMD accelerator node. If it stays near idle while generation runs, the model is on the CPU — check that `gpu_layers` survived into the load (LocalAI's macOS hardware auto-tuning can zero it; `LOCALAI_DISABLE_HARDWARE_DEFAULTS=true` turns that off).
+A 4B Q4_K_M model resident on the GPU shows ~3.1–3.5 GiB in use on the AMD accelerator node (measured: 3.29 GB with `flash_attention: "true"`, ctx 4096, f16 KV). If it stays near idle while generation runs, the model is on the CPU — check that `gpu_layers` survived into the load (LocalAI's macOS hardware auto-tuning can zero it; `LOCALAI_DISABLE_HARDWARE_DEFAULTS=true` turns that off).
+
+Sustained serving throughput on this stack, 128-token completions against a warm server: **~28–31 tok/s** for Qwen3-4B-Instruct-2507 Q4_K_M. That is the most reproducible measurement on this machine — much tighter than `llama-bench`, whose numbers swing ~2.4x with GPU clock state alone.
 
 A thinking model (Qwen3, etc.) returns its chain of thought in `choices[].message.reasoning` and leaves `content` empty until it closes the think block — an empty `content` with `finish_reason: "length"` is a token budget problem, not a correctness one.
 
@@ -230,12 +254,14 @@ Open the returned URL. A recognisable apple means the whole path is correct; ful
 
 | Role | Model | Why |
 |---|---|---|
-| Text, default | **Granite-4.0-H-Micro** Q4_K_M | Best tool calling measured here including negative cases, the only model that finishes a 12–19K-token prompt, Mamba-2 hybrid so context growth costs almost no VRAM, ~2.1 GB headroom. Served at **32 tok/s**. |
-| Text, alternative | Qwen3-4B-Instruct-2507 Q4_K_M | Marginally better single-turn function-calling score; dense, so the KV cache grows fast — keep contexts short. 27–28 tok/s. |
+| Text, default | **Granite-4.0-H-Micro** Q4_K_M | Best tool calling measured here including negative cases (24/24 on a local set, 0.863 BFCL AST). Mamba-2 hybrid, so context growth costs almost no VRAM — the property that matters for a loop that accumulates history. ~2.1 GB headroom, served at **32 tok/s**. |
+| Text, alternative | Qwen3-4B-Instruct-2507 Q4_K_M | Marginally better single-turn function-calling score and faster on the fixed stack (40 tg128 in `llama-bench`); dense, so the KV cache grows fastest in the set — bound your contexts or quantize the cache. |
 | Image, default | **SD-Turbo** `wtype:q8_0` | 2 GB, 1–4 steps, comfortable headroom. |
 | Image, ecosystem | SD 1.5 fp16 | 2 GB, 20 steps, the largest LoRA/ControlNet library. |
 
 Granite requires the `SSM_SCAN`/`GATED_DELTA_NET` shader fix from step 2 — without it, hybrid models emit token salad on the GPU while staying coherent on CPU.
+
+An earlier revision credited Granite as "the only model that finishes a 12–19K-token prompt". That was an artifact of a 400 s client timeout in the bench scripts, not a property of the models: re-measured on the fixed stack, an 8192-token prefill completes in 4–6 minutes on Qwen3-4B-2507 and neither loses the device. Pick Granite for the recurrent state and the tool calling, not for being the only survivor.
 
 ## 7. Packaging a DMG
 
