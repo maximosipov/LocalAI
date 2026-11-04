@@ -150,3 +150,6 @@ addons/internal/uibuild/test/*/dist
 # Add-on zip files and the scratch of scripts/addons/zip.sh
 dist/addons/
 .cache/addons/zip/
+
+# Radeon MacBook app bundle output (contrib/macos-radeon-app/build-app.sh)
+dist/macos-app/

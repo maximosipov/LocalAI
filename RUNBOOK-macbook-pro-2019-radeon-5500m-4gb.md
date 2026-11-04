@@ -271,4 +271,12 @@ The part that takes the work is making the bundle self-contained. `grpc-server` 
 
 Weights are deliberately **not** bundled — they are gigabytes. The launcher seeds the model YAMLs into `~/Library/Application Support/LocalAI/models` on first run and symlinks weights from a development checkout when one is present.
 
+The app and its packaging script are in `contrib/macos-radeon-app/`. After building `./local-ai` and the Vulkan backends:
+
+```bash
+MODELS_SEED=/path/to/model-yamls contrib/macos-radeon-app/build-app.sh   # -> dist/macos-app/LocalAI-M.dmg
+```
+
+`MODELS_SEED` is optional. The app passes `--addons-enabled=false`, which v4.12 needs to start when built with `make build`.
+
 Result on this machine: a 367 MB `.app`, a 143 MB compressed DMG, ad-hoc signed (no Apple identity here, so it is not notarized — clear the quarantine bit on first launch with `xattr -dr com.apple.quarantine "/Applications/LocalAI M.app"`).
