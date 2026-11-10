@@ -54,27 +54,30 @@ git checkout -b build "$PIN"
 # The fix commits from the fork's macbook-pro-2019-radeon-5500m-4gb branch, oldest
 # first. Explicit SHAs: upstream llama.cpp history has its own unrelated "vulkan: fix ..."
 # commits, so a message grep is not safe here.
-git cherry-pick 7847fca13 595936bcd a91f29c5f \
-                acb45b872 8cbd19056 8e8d7fb26 16ea5d8e7 e629266a1 2707498b9
+git cherry-pick 596f1b8d1 ac2993987 5cff7ef12 89076c4e5 e671e754d \
+                7723fc8be 22d8de9f4 d190dfead 2fde960d2 0653a3821
 git submodule update --init --recursive --depth 1
 cd ../../../..
 ```
 
 | Commit | What it does |
 |---|---|
-| `7847fca13` | matmul subgroup correctness on MoltenVK (RDNA1 + older Intel iGPUs) |
-| `595936bcd` | NaN `SSM_SCAN` / `GATED_DELTA_NET` — hybrid/state-space models (Granite-4.0-H, Qwen3.5) |
-| `a91f29c5f` | diagnostic env knobs (opt-in, no default change) |
-| `acb45b872` | disable subgroup clustered ops — fixes the q8_1 activation quantizer |
-| `8cbd19056` | enable emulated integer dot for matmul: **+68% prefill** |
-| `8e8d7fb26` | flash-attention subgroup diagnostic knob (superseded by the next one) |
-| `16ea5d8e7` | **run flash attention on the GPU** — it was silently falling back to CPU |
-| `e629266a1` | guard the broken q8_0 `mul_mat_vecq` path |
-| `2707498b9` | trust MoltenVK subgroups from 1.4.2 onwards |
+| `596f1b8d1` | matmul subgroup correctness on MoltenVK (RDNA1 + older Intel iGPUs) |
+| `ac2993987` | NaN `SSM_SCAN` / `GATED_DELTA_NET`: hybrid/state-space models (Granite-4.0-H, Qwen3.5) |
+| `5cff7ef12` | diagnostic env knobs (opt-in, no default change) |
+| `89076c4e5` | disable subgroup clustered ops: fixes the q8_1 activation quantizer |
+| `e671e754d` | enable emulated integer dot for matmul: **+68% prefill** |
+| `7723fc8be` | flash-attention subgroup diagnostic knob (superseded by the next one) |
+| `22d8de9f4` | **run flash attention on the GPU**: it was silently falling back to CPU |
+| `d190dfead` | guard the broken q8_0 `mul_mat_vecq` path |
+| `2fde960d2` | trust MoltenVK subgroups from 1.4.2 onwards |
+| `0653a3821` | keep q8_0 off the flash-attention MMQ path |
 
-Verified: all nine cherry-pick cleanly onto `1cbfd1988`, and `prepare.sh` still grafts on top. If a future `LLAMA_VERSION` bump makes them stop applying, the changes are narrow (`ggml-vulkan.cpp` plus three `.comp` shaders) — diff them off the branch and re-apply.
+Verified: all ten cherry-pick cleanly onto `4c4ca5b18`, and the result is the same code as the fork branch's `821a0ad27`. `prepare.sh` grafts on top and the backend builds. If a future `LLAMA_VERSION` bump makes them stop applying, the changes are narrow (`ggml-vulkan.cpp` plus a few `.comp` shaders): diff them off the branch and re-apply.
 
-Then graft in LocalAI's gRPC server. **Run this once**: `prepare.sh` applies LocalAI's own patches to the llama.cpp tree and is not idempotent.
+The pin matters for speed, not only for compiling. With the previous pin, `785322d17`, the backend prefilled Gemma-4-E2B at about 75-79 tok/s. On `4c4ca5b18` it prefills at 220-258 tok/s, the same as a standalone `llama-server` on this card. Decode speed is unchanged.
+
+Then graft in LocalAI's gRPC server. **Run this once**: `prepare.sh` applies LocalAI's own patches to the llama.cpp tree and is not idempotent. A second run reverses the patches (`patch` takes them as already applied) and the build then fails on missing `score_enabled` / `SERVER_TASK_TYPE_SCORE`. `make grpc-server` runs `prepare.sh` itself whenever `llama.cpp/` is newer than `llama.cpp/tools/grpc-server/`, so `touch llama.cpp/tools/grpc-server` after grafting. To recover from a double run, re-apply the patch with `patch -d llama.cpp -p1 --forward < patches/0001-add-server-task-type-score.patch` and copy `server-context.cpp` and `server-task.h` from `llama.cpp/tools/server/` into `llama.cpp/tools/grpc-server/` again.
 
 ```sh
 cd backend/cpp/llama-cpp
@@ -88,7 +91,7 @@ cd ../../..
 ```sh
 P="$(brew --prefix)"
 export BUILD_TYPE=vulkan
-export CMAKE_ARGS="-DGGML_METAL=OFF \
+export CMAKE_ARGS="-DGGML_METAL=OFF -DGGML_OPENMP=OFF \
   -DVulkan_INCLUDE_DIR=$P/opt/vulkan-headers/include \
   -DVulkan_LIBRARY=$P/opt/vulkan-loader/lib/libvulkan.dylib \
   -DVulkan_GLSLC_EXECUTABLE=$P/opt/shaderc/bin/glslc \
@@ -104,6 +107,7 @@ Two non-obvious details, both of which produce a build that *looks* fine and beh
 
 - **`CMAKE_ARGS` must be exported, not passed on the make command line.** `backend/cpp/llama-cpp/Makefile` does `CMAKE_ARGS?=` and then several `CMAKE_ARGS+=`. A command-line variable assignment overrides those appends, silently dropping `-DGGML_VULKAN=1` itself. An environment variable seeds `?=` and keeps the appends.
 - **`-DGGML_METAL=OFF` is required.** In that Makefile, `BUILD_TYPE=vulkan` and the `Darwin` case are arms of a single if/else chain — so on macOS, choosing vulkan means the Darwin arm (the one that would have turned Metal off) never runs. ggml auto-enables Metal on macOS, and Metal then wins device 0 at runtime.
+- **`-DGGML_OPENMP=OFF` with Apple clang 21 (Command Line Tools) and Homebrew `libomp` 16.** That clang emits `__kmpc_dispatch_deinit`, which libomp 16 does not export, so the link fails with an undefined symbol from `libggml-base.a`. ggml's own thread pool replaces OpenMP; the model runs on the GPU, so nothing measurable is lost. Upgrading `libomp` is the other way out.
 
 Gate:
 
