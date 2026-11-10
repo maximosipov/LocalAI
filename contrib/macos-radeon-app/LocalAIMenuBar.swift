@@ -59,10 +59,15 @@ final class Controller: NSObject, NSApplicationDelegate {
         try? fm.createDirectory(at: support.appendingPathComponent("logs"),
                                 withIntermediateDirectories: true)
 
-        let seed = resources.appendingPathComponent("models-seed")
-        for yaml in (try? fm.contentsOfDirectory(at: seed, includingPropertiesForKeys: nil)) ?? [] {
-            let dst = modelsDir.appendingPathComponent(yaml.lastPathComponent)
-            if !fm.fileExists(atPath: dst.path) { try? fm.copyItem(at: yaml, to: dst) }
+        // Seed only while the models folder holds no config yet. Copying every missing seed
+        // on each launch brought back models the user had deleted.
+        let existing = (try? fm.contentsOfDirectory(atPath: modelsDir.path)) ?? []
+        if !existing.contains(where: { $0.hasSuffix(".yaml") }) {
+            let seed = resources.appendingPathComponent("models-seed")
+            for yaml in (try? fm.contentsOfDirectory(at: seed, includingPropertiesForKeys: nil)) ?? [] {
+                let dst = modelsDir.appendingPathComponent(yaml.lastPathComponent)
+                if !fm.fileExists(atPath: dst.path) { try? fm.copyItem(at: yaml, to: dst) }
+            }
         }
 
         // Weights are not bundled. If a development checkout is present, symlink its

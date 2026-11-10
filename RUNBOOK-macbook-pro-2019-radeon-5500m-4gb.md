@@ -269,7 +269,7 @@ LocalAI has no upstream desktop app, so the bundle is a launcher app: it exports
 
 The part that takes the work is making the bundle self-contained. `grpc-server` links **107 Homebrew dylibs** (grpc, protobuf, abseil, re2, c-ares, openssl@3, libomp, vulkan-loader). The packaging script walks that closure with `otool`, copies each library into `Contents/Frameworks/`, rewrites every install name to `@rpath`, and adds the matching rpaths; the ICD json inside the bundle points at `../../Frameworks/libMoltenVK.dylib` so the app can be moved anywhere. The acceptance test is that no `/usr/local/opt` path survives anywhere in the bundle.
 
-Weights are deliberately **not** bundled — they are gigabytes. The launcher seeds the model YAMLs into `~/Library/Application Support/LocalAI/models` on first run and symlinks weights from a development checkout when one is present.
+Weights are deliberately **not** bundled — they are gigabytes. The launcher seeds the model YAMLs into `~/Library/Application Support/LocalAI/models` only while that folder holds no YAML (first run), so a model you delete stays deleted, and it symlinks weights from a development checkout when one is present.
 
 The app and its packaging script are in `contrib/macos-radeon-app/`. After building `./local-ai` and the Vulkan backends:
 
