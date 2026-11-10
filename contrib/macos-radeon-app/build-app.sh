@@ -151,9 +151,12 @@ mkdir -p "$MODELS" "$SUPPORT/logs"
 
 # Seed model configs on first run. Weights are NOT bundled (they are gigabytes); if the
 # development checkout is present, symlink them, otherwise the YAMLs document what to add.
-for y in "$RES"/models-seed/*.yaml; do
-  [ -e "$MODELS/$(basename "$y")" ] || cp "$y" "$MODELS/"
-done
+# Seed only while the models folder holds no config, so deleted models stay deleted.
+if ! ls "$MODELS"/*.yaml >/dev/null 2>&1; then
+  for y in "$RES"/models-seed/*.yaml; do
+    [ -e "$y" ] && cp "$y" "$MODELS/"
+  done
+fi
 for d in "${LOCALAI_DEV_MODELS:-$HOME/Projects/macbook-pro-2019-local-ai/scratchpad/models-localai}"; do
   [ -d "$d" ] || continue
   for w in "$d"/*.gguf "$d"/*.safetensors; do
